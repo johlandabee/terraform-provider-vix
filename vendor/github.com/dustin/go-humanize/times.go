@@ -2,14 +2,14 @@ package humanize
 
 import (
 	"fmt"
+	"math"
+	"sort"
 	"time"
 )
 
 // Seconds-based time units
 const (
-	Minute   = 60
-	Hour     = 60 * Minute
-	Day      = 24 * Hour
+	Day      = 24 * time.Hour
 	Week     = 7 * Day
 	Month    = 30 * Day
 	Year     = 12 * Month
@@ -20,60 +20,98 @@ const (
 //
 // Time(someT) -> "3 weeks ago"
 func Time(then time.Time) string {
-	now := time.Now()
+	return RelTime(then, time.Now(), "ago", "from now")
+}
 
-	lbl := "ago"
-	diff := now.Unix() - then.Unix()
+// A RelTimeMagnitude struct contains a relative time point at which
+// the relative format of time will switch to a new format string.  A
+// slice of these in ascending order by their "D" field is passed to
+// CustomRelTime to format durations.
+//
+// The Format field is a string that may contain a "%s" which will be
+// replaced with the appropriate signed label (e.g. "ago" or "from
+// now") and a "%d" that will be replaced by the quantity.
+//
+// The DivBy field is the amount of time the time difference must be
+// divided by in order to display correctly.
+//
+// e.g. if D is 2*time.Minute and you want to display "%d minutes %s"
+// DivBy should be time.Minute so whatever the duration is will be
+// expressed in minutes.
+type RelTimeMagnitude struct {
+	D      time.Duration
+	Format string
+	DivBy  time.Duration
+}
 
-	after := then.After(now)
-	if after {
-		lbl = "from now"
-		diff = then.Unix() - now.Unix()
+var defaultMagnitudes = []RelTimeMagnitude{
+	{time.Second, "now", time.Second},
+	{2 * time.Second, "1 second %s", 1},
+	{time.Minute, "%d seconds %s", time.Second},
+	{2 * time.Minute, "1 minute %s", 1},
+	{time.Hour, "%d minutes %s", time.Minute},
+	{2 * time.Hour, "1 hour %s", 1},
+	{Day, "%d hours %s", time.Hour},
+	{2 * Day, "1 day %s", 1},
+	{Week, "%d days %s", Day},
+	{2 * Week, "1 week %s", 1},
+	{Month, "%d weeks %s", Week},
+	{2 * Month, "1 month %s", 1},
+	{Year, "%d months %s", Month},
+	{18 * Month, "1 year %s", 1},
+	{2 * Year, "2 years %s", 1},
+	{LongTime, "%d years %s", Year},
+	{math.MaxInt64, "a long while %s", 1},
+}
+
+// RelTime formats a time into a relative string.
+//
+// It takes two times and two labels.  In addition to the generic time
+// delta string (e.g. 5 minutes), the labels are used applied so that
+// the label corresponding to the smaller time is applied.
+//
+// RelTime(timeInPast, timeInFuture, "earlier", "later") -> "3 weeks earlier"
+func RelTime(a, b time.Time, albl, blbl string) string {
+	return CustomRelTime(a, b, albl, blbl, defaultMagnitudes)
+}
+
+// CustomRelTime formats a time into a relative string.
+//
+// It takes two times two labels and a table of relative time formats.
+// In addition to the generic time delta string (e.g. 5 minutes), the
+// labels are used applied so that the label corresponding to the
+// smaller time is applied.
+func CustomRelTime(a, b time.Time, albl, blbl string, magnitudes []RelTimeMagnitude) string {
+	lbl := albl
+	diff := b.Sub(a)
+
+	if a.After(b) {
+		lbl = blbl
+		diff = a.Sub(b)
 	}
 
-	switch {
-	case diff <= 0:
-		return "now"
-	case diff <= 2:
-		return fmt.Sprintf("1 second %s", lbl)
-	case diff < 1*Minute:
-		return fmt.Sprintf("%d seconds %s", diff, lbl)
+	n := sort.Search(len(magnitudes), func(i int) bool {
+		return magnitudes[i].D > diff
+	})
 
-	case diff < 2*Minute:
-		return fmt.Sprintf("1 minute %s", lbl)
-	case diff < 1*Hour:
-		return fmt.Sprintf("%d minutes %s", diff/Minute, lbl)
-
-	case diff < 2*Hour:
-		return fmt.Sprintf("1 hour %s", lbl)
-	case diff < 1*Day:
-		return fmt.Sprintf("%d hours %s", diff/Hour, lbl)
-
-	case diff < 2*Day:
-		return fmt.Sprintf("1 day %s", lbl)
-	case diff < 1*Week:
-		return fmt.Sprintf("%d days %s", diff/Day, lbl)
-
-	case diff < 2*Week:
-		return fmt.Sprintf("1 week %s", lbl)
-	case diff < 1*Month:
-		return fmt.Sprintf("%d weeks %s", diff/Week, lbl)
-
-	case diff < 2*Month:
-		return fmt.Sprintf("1 month %s", lbl)
-	case diff < 1*Year:
-		return fmt.Sprintf("%d months %s", diff/Month, lbl)
-
-	case diff < 18*Month:
-		return fmt.Sprintf("1 year %s", lbl)
-	case diff < 2*Year:
-		return fmt.Sprintf("2 years %s", lbl)
-	case diff < LongTime:
-		return fmt.Sprintf("%d years %s", diff/Year, lbl)
+	if n >= len(magnitudes) {
+		n = len(magnitudes) - 1
 	}
-
-	if after {
-		return "a while from now"
+	mag := magnitudes[n]
+	args := []interface{}{}
+	escaped := false
+	for _, ch := range mag.Format {
+		if escaped {
+			switch ch {
+			case 's':
+				args = append(args, lbl)
+			case 'd':
+				args = append(args, diff/mag.DivBy)
+			}
+			escaped = false
+		} else {
+			escaped = ch == '%'
+		}
 	}
-	return "long ago"
+	return fmt.Sprintf(mag.Format, args...)
 }

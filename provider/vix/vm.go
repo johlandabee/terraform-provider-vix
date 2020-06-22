@@ -13,7 +13,7 @@ import (
 
 	"github.com/c4milo/unpackit"
 	"github.com/dustin/go-humanize"
-	govix "github.com/hooklift/govix"
+	govix "github.com/johlandabee/govix"
 )
 
 // Virtual machine configuration

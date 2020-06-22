@@ -46,9 +46,17 @@ type Session struct {
 	pingID   uint32
 	pingLock sync.Mutex
 
-	// streams maps a stream id to a stream
+	// streams maps a stream id to a stream, and inflight has an entry
+	// for any outgoing stream that has not yet been established. Both are
+	// protected by streamLock.
 	streams    map[uint32]*Stream
+	inflight   map[uint32]struct{}
 	streamLock sync.Mutex
+
+	// synCh acts like a semaphore. It is sized to the AcceptBacklog which
+	// is assumed to be symmetric between the client and server. This allows
+	// the client to avoid exceeding the backlog and instead blocks the open.
+	synCh chan struct{}
 
 	// acceptCh is used to pass ready streams to the client
 	acceptCh chan *Stream
@@ -56,6 +64,10 @@ type Session struct {
 	// sendCh is used to mark a stream as ready to send,
 	// or to send a header out directly.
 	sendCh chan sendReady
+
+	// recvDoneCh is closed when recv() exits to avoid a race
+	// between stream registration and stream shutdown
+	recvDoneCh chan struct{}
 
 	// shutdown is used to safely close a session
 	shutdown     bool
@@ -81,8 +93,11 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 		bufRead:    bufio.NewReader(conn),
 		pings:      make(map[uint32]chan struct{}),
 		streams:    make(map[uint32]*Stream),
+		inflight:   make(map[uint32]struct{}),
+		synCh:      make(chan struct{}, config.AcceptBacklog),
 		acceptCh:   make(chan *Stream, config.AcceptBacklog),
 		sendCh:     make(chan sendReady, 64),
+		recvDoneCh: make(chan struct{}),
 		shutdownCh: make(chan struct{}),
 	}
 	if client {
@@ -108,9 +123,27 @@ func (s *Session) IsClosed() bool {
 	}
 }
 
+// CloseChan returns a read-only channel which is closed as
+// soon as the session is closed.
+func (s *Session) CloseChan() <-chan struct{} {
+	return s.shutdownCh
+}
+
+// NumStreams returns the number of currently open streams
+func (s *Session) NumStreams() int {
+	s.streamLock.Lock()
+	num := len(s.streams)
+	s.streamLock.Unlock()
+	return num
+}
+
 // Open is used to create a new stream as a net.Conn
 func (s *Session) Open() (net.Conn, error) {
-	return s.OpenStream()
+	conn, err := s.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // OpenStream is used to create a new stream
@@ -122,8 +155,15 @@ func (s *Session) OpenStream() (*Stream, error) {
 		return nil, ErrRemoteGoAway
 	}
 
+	// Block if we have too many inflight SYNs
+	select {
+	case s.synCh <- struct{}{}:
+	case <-s.shutdownCh:
+		return nil, ErrSessionShutdown
+	}
+
 GET_ID:
-	// Get and ID, and check for stream exhaustion
+	// Get an ID, and check for stream exhaustion
 	id := atomic.LoadUint32(&s.nextStreamID)
 	if id >= math.MaxUint32-1 {
 		return nil, ErrStreamsExhausted
@@ -136,16 +176,29 @@ GET_ID:
 	stream := newStream(s, id, streamInit)
 	s.streamLock.Lock()
 	s.streams[id] = stream
+	s.inflight[id] = struct{}{}
 	s.streamLock.Unlock()
 
 	// Send the window update to create
-	return stream, stream.sendWindowUpdate()
+	if err := stream.sendWindowUpdate(); err != nil {
+		select {
+		case <-s.synCh:
+		default:
+			s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
+		}
+		return nil, err
+	}
+	return stream, nil
 }
 
 // Accept is used to block until the next available stream
 // is ready to be accepted.
 func (s *Session) Accept() (net.Conn, error) {
-	return s.AcceptStream()
+	conn, err := s.AcceptStream()
+	if err != nil {
+		return nil, err
+	}
+	return conn, err
 }
 
 // AcceptStream is used to block until the next available stream
@@ -153,7 +206,10 @@ func (s *Session) Accept() (net.Conn, error) {
 func (s *Session) AcceptStream() (*Stream, error) {
 	select {
 	case stream := <-s.acceptCh:
-		return stream, stream.sendWindowUpdate()
+		if err := stream.sendWindowUpdate(); err != nil {
+			return nil, err
+		}
+		return stream, nil
 	case <-s.shutdownCh:
 		return nil, s.shutdownErr
 	}
@@ -174,6 +230,7 @@ func (s *Session) Close() error {
 	}
 	close(s.shutdownCh)
 	s.conn.Close()
+	<-s.recvDoneCh
 
 	s.streamLock.Lock()
 	defer s.streamLock.Unlock()
@@ -231,6 +288,11 @@ func (s *Session) Ping() (time.Duration, error) {
 	start := time.Now()
 	select {
 	case <-ch:
+	case <-time.After(s.config.ConnectionWriteTimeout):
+		s.pingLock.Lock()
+		delete(s.pings, id) // Ignore it if a response comes later.
+		s.pingLock.Unlock()
+		return 0, ErrTimeout
 	case <-s.shutdownCh:
 		return 0, ErrSessionShutdown
 	}
@@ -245,7 +307,14 @@ func (s *Session) keepalive() {
 	for {
 		select {
 		case <-time.After(s.config.KeepAliveInterval):
-			s.Ping()
+			_, err := s.Ping()
+			if err != nil {
+				if err != ErrSessionShutdown {
+					s.logger.Printf("[ERR] yamux: keepalive failed: %v", err)
+					s.exitErr(ErrKeepAliveTimeout)
+				}
+				return
+			}
 		case <-s.shutdownCh:
 			return
 		}
@@ -258,29 +327,64 @@ func (s *Session) waitForSend(hdr header, body io.Reader) error {
 	return s.waitForSendErr(hdr, body, errCh)
 }
 
-// waitForSendErr waits to send a header, checking for a potential shutdown
+// waitForSendErr waits to send a header with optional data, checking for a
+// potential shutdown. Since there's the expectation that sends can happen
+// in a timely manner, we enforce the connection write timeout here.
 func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error) error {
+	t := timerPool.Get()
+	timer := t.(*time.Timer)
+	timer.Reset(s.config.ConnectionWriteTimeout)
+	defer func() {
+		timer.Stop()
+		select {
+		case <-timer.C:
+		default:
+		}
+		timerPool.Put(t)
+	}()
+
 	ready := sendReady{Hdr: hdr, Body: body, Err: errCh}
 	select {
 	case s.sendCh <- ready:
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
+	case <-timer.C:
+		return ErrConnectionWriteTimeout
 	}
+
 	select {
 	case err := <-errCh:
 		return err
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
+	case <-timer.C:
+		return ErrConnectionWriteTimeout
 	}
 }
 
-// sendNoWait does a send without waiting
+// sendNoWait does a send without waiting. Since there's the expectation that
+// the send happens right here, we enforce the connection write timeout if we
+// can't queue the header to be sent.
 func (s *Session) sendNoWait(hdr header) error {
+	t := timerPool.Get()
+	timer := t.(*time.Timer)
+	timer.Reset(s.config.ConnectionWriteTimeout)
+	defer func() {
+		timer.Stop()
+		select {
+		case <-timer.C:
+		default:
+		}
+		timerPool.Put(t)
+	}()
+
 	select {
 	case s.sendCh <- sendReady{Hdr: hdr}:
 		return nil
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
+	case <-timer.C:
+		return ErrConnectionWriteTimeout
 	}
 }
 
@@ -325,44 +429,47 @@ func (s *Session) send() {
 
 // recv is a long running goroutine that accepts new data
 func (s *Session) recv() {
+	if err := s.recvLoop(); err != nil {
+		s.exitErr(err)
+	}
+}
+
+// Ensure that the index of the handler (typeData/typeWindowUpdate/etc) matches the message type
+var (
+	handlers = []func(*Session, header) error{
+		typeData:         (*Session).handleStreamMessage,
+		typeWindowUpdate: (*Session).handleStreamMessage,
+		typePing:         (*Session).handlePing,
+		typeGoAway:       (*Session).handleGoAway,
+	}
+)
+
+// recvLoop continues to receive data until a fatal error is encountered
+func (s *Session) recvLoop() error {
+	defer close(s.recvDoneCh)
 	hdr := header(make([]byte, headerSize))
-	var handler func(header) error
 	for {
 		// Read the header
 		if _, err := io.ReadFull(s.bufRead, hdr); err != nil {
 			if err != io.EOF && !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "reset by peer") {
 				s.logger.Printf("[ERR] yamux: Failed to read header: %v", err)
 			}
-			s.exitErr(err)
-			return
+			return err
 		}
 
 		// Verify the version
 		if hdr.Version() != protoVersion {
 			s.logger.Printf("[ERR] yamux: Invalid protocol version: %d", hdr.Version())
-			s.exitErr(ErrInvalidVersion)
-			return
+			return ErrInvalidVersion
 		}
 
-		// Switch on the type
-		switch hdr.MsgType() {
-		case typeData:
-			handler = s.handleStreamMessage
-		case typeWindowUpdate:
-			handler = s.handleStreamMessage
-		case typeGoAway:
-			handler = s.handleGoAway
-		case typePing:
-			handler = s.handlePing
-		default:
-			s.exitErr(ErrInvalidMsgType)
-			return
+		mt := hdr.MsgType()
+		if mt < typeData || mt > typeGoAway {
+			return ErrInvalidMsgType
 		}
 
-		// Invoke the handler
-		if err := handler(hdr); err != nil {
-			s.exitErr(err)
-			return
+		if err := handlers[mt](s, hdr); err != nil {
+			return err
 		}
 	}
 }
@@ -401,7 +508,9 @@ func (s *Session) handleStreamMessage(hdr header) error {
 	// Check if this is a window update
 	if hdr.MsgType() == typeWindowUpdate {
 		if err := stream.incrSendWindow(hdr, flags); err != nil {
-			s.sendNoWait(s.goAway(goAwayProtoErr))
+			if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
+				s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
+			}
 			return err
 		}
 		return nil
@@ -409,7 +518,9 @@ func (s *Session) handleStreamMessage(hdr header) error {
 
 	// Read the new data
 	if err := stream.readData(hdr, flags, s.bufRead); err != nil {
-		s.sendNoWait(s.goAway(goAwayProtoErr))
+		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
+			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
+		}
 		return err
 	}
 	return nil
@@ -420,11 +531,16 @@ func (s *Session) handlePing(hdr header) error {
 	flags := hdr.Flags()
 	pingID := hdr.Length()
 
-	// Check if this is a query, respond back
+	// Check if this is a query, respond back in a separate context so we
+	// don't interfere with the receiving thread blocking for the write.
 	if flags&flagSYN == flagSYN {
-		hdr := header(make([]byte, headerSize))
-		hdr.encode(typePing, flagACK, 0, pingID)
-		s.sendNoWait(hdr)
+		go func() {
+			hdr := header(make([]byte, headerSize))
+			hdr.encode(typePing, flagACK, 0, pingID)
+			if err := s.sendNoWait(hdr); err != nil {
+				s.logger.Printf("[WARN] yamux: failed to send ping reply: %v", err)
+			}
+		}()
 		return nil
 	}
 
@@ -476,7 +592,9 @@ func (s *Session) incomingStream(id uint32) error {
 	// Check if stream already exists
 	if _, ok := s.streams[id]; ok {
 		s.logger.Printf("[ERR] yamux: duplicate stream declared")
-		s.sendNoWait(s.goAway(goAwayProtoErr))
+		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
+			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
+		}
 		return ErrDuplicateStream
 	}
 
@@ -497,9 +615,34 @@ func (s *Session) incomingStream(id uint32) error {
 }
 
 // closeStream is used to close a stream once both sides have
-// issued a close.
+// issued a close. If there was an in-flight SYN and the stream
+// was not yet established, then this will give the credit back.
 func (s *Session) closeStream(id uint32) {
 	s.streamLock.Lock()
+	if _, ok := s.inflight[id]; ok {
+		select {
+		case <-s.synCh:
+		default:
+			s.logger.Printf("[ERR] yamux: SYN tracking out of sync")
+		}
+	}
 	delete(s.streams, id)
+	s.streamLock.Unlock()
+}
+
+// establishStream is used to mark a stream that was in the
+// SYN Sent state as established.
+func (s *Session) establishStream(id uint32) {
+	s.streamLock.Lock()
+	if _, ok := s.inflight[id]; ok {
+		delete(s.inflight, id)
+	} else {
+		s.logger.Printf("[ERR] yamux: established stream without inflight SYN (no tracking entry)")
+	}
+	select {
+	case <-s.synCh:
+	default:
+		s.logger.Printf("[ERR] yamux: established stream without inflight SYN (didn't have semaphore)")
+	}
 	s.streamLock.Unlock()
 }
